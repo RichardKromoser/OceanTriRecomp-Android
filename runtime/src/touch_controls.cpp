@@ -1,4 +1,5 @@
 #include "touch_controls.h"
+#include "controller_host.h"
 #include "android_keyboard.h"
 #include "droid_sans_atlas.h"
 #include "language.h"
@@ -372,6 +373,11 @@ public:
         AddBtn("M4", "A+B", (MH3_CL_A | MH3_CL_B), { diamondNormX + spreadX * 0.5f, diamondNormY + spreadY * 1.15f }, btnR * 0.95f,
                { 0.85f, 0.48f, 0.18f, 0.60f }, { 1.0f, 0.70f, 0.30f, 0.95f });
 
+        // Dedicated target-lock tap button. Its position and size are editable
+        // like the other touch buttons; it does not consume a gamepad button.
+        AddBtn("LOCK", "LOCK", 0, { 0.73f, 0.20f }, btnR * 0.90f,
+               { 0.08f, 0.55f, 0.62f, 0.72f }, { 0.30f, 0.95f, 1.00f, 0.98f });
+
         // A, B, X, Y (after macros so macros win collision priority)
         AddBtn("A", "A", MH3_CL_A, { diamondNormX + spreadX, diamondNormY }, btnR,
                { 0.85f, 0.25f, 0.25f, 0.55f }, { 1.0f, 0.40f, 0.40f, 0.90f });
@@ -500,7 +506,10 @@ public:
             if (dx * dx + dy * dy <= (btn.radius * 1.35f) * (btn.radius * 1.35f)) {
                 btn.isPressed = true;
                 btn.fingerId = int(id);
-                m_latchedMask.fetch_or(uint32_t(btn.mask), std::memory_order_relaxed);
+                if (btn.id == "LOCK")
+                    QueueTouchTargetTap();
+                else
+                    m_latchedMask.fetch_or(uint32_t(btn.mask), std::memory_order_relaxed);
                 if (btn.mask & MH3_CL_B) {
                     PointerControls::SetHoldingB(true);
                 }

@@ -30,6 +30,11 @@ ClassicControllerSample ReadLiveController();
 // Relative mouse deltas collected by the SDL host; camera input consumes each axis once.
 int32_t TakeMouseLookXDelta();
 int32_t TakeMouseLookYDelta();
+
+// Touchscreen target-lock button and manual-camera override notifications.
+void QueueTouchTargetTap();
+uint32_t TakeTouchTargetTaps();
+bool TakeTouchCameraMoved();
 #ifdef __vita__
 // sceCtrl through mh3_vita_pad_to_classic (runtime/vita/vita_controller.cpp).
 ClassicControllerSample ReadVitaController();

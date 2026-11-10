@@ -25,6 +25,8 @@ uint64_t inputFrame = 0;
 bool playbackHeld = false;
 std::atomic<int32_t> pendingMouseLookX{0};
 std::atomic<int32_t> pendingMouseLookY{0};
+std::atomic<uint32_t> pendingTouchTargetTaps{0};
+std::atomic<bool> touchCameraMoved{false};
 
 void QueueMouseDelta(std::atomic<int32_t>& target, int32_t delta) {
     if (delta == 0)
@@ -297,11 +299,26 @@ const char* Gamepad_GetInputName(int inputCode, int layout, int lang) {
 } // extern "C"
 
 void QueueTouchCameraDelta(float dx, float dy) {
+    if (std::abs(dx) > 0.01f || std::abs(dy) > 0.01f)
+        touchCameraMoved.store(true, std::memory_order_relaxed);
+
     const double sensitivity = mh3_mouse_look_sensitivity::GetSensitivity();
     int32_t adjX = int32_t(std::clamp(-double(dx) * sensitivity * 1.5, -512.0, 512.0));
     int32_t adjY = int32_t(std::clamp(double(dy) * sensitivity * 1.5, -512.0, 512.0));
     QueueMouseDelta(pendingMouseLookX, adjX);
     QueueMouseDelta(pendingMouseLookY, adjY);
+}
+
+void QueueTouchTargetTap() {
+    pendingTouchTargetTaps.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint32_t TakeTouchTargetTaps() {
+    return pendingTouchTargetTaps.exchange(0, std::memory_order_relaxed);
+}
+
+bool TakeTouchCameraMoved() {
+    return touchCameraMoved.exchange(false, std::memory_order_relaxed);
 }
 
 namespace {

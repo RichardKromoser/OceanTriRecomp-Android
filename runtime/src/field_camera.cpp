@@ -27,9 +27,9 @@
 #include "guest_call.h"
 #include "port_check.h"
 #include "hunter_telemetry.h"
-#ifdef MH3_DEVELOPMENT
 #include "cheats.h"
 #include "controller_host.h"
+#ifdef MH3_DEVELOPMENT
 #include "dev_options.h"
 #include "native_frame_packet.h"
 #include <chrono>
@@ -168,6 +168,78 @@ uint32_t R32(uint32_t a) {
 
 void W32(uint32_t a, uint32_t v) {
     Memory::Write32(a, v);
+}
+
+// The quest catalog's large-monster kind IDs. Small monsters are deliberately
+// excluded so the touch lock-on never snaps to Jaggi, fish or other small mobs.
+constexpr uint8_t kLargeMonsterKinds[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 14, 15, 16, 18, 19, 20, 24, 25};
+constexpr uint32_t kMonsterKind = 0x003;
+constexpr uint32_t kMonsterPosition = 0x188;
+constexpr uint32_t kMonsterHeight = 0x370;
+
+struct TouchLockState {
+    // 0: unlocked, 1: initial target, 2: switched target (next tap unlocks).
+    uint8_t phase = 0;
+    uint32_t targetIndex = 0;
+    uint32_t targetWork = 0;
+    uint8_t targetKind = 0;
+    float focus[3]{};
+    bool focusInitialized = false;
+    double manualOverrideTicks = 0.0;
+};
+
+TouchLockState& TouchLock() {
+    static TouchLockState state;
+    return state;
+}
+
+bool IsLargeMonster(uint32_t work) {
+    if (!work || Memory::Read16(work) != 0x0101)
+        return false;
+
+    const uint8_t kind = Memory::Read8(work + kMonsterKind);
+    for (uint8_t candidate : kLargeMonsterKinds) {
+        if (candidate == kind)
+            return true;
+    }
+    return false;
+}
+
+int32_t NearestLargeMonster(uint32_t plw, int32_t exceptIndex) {
+    const uint32_t count = Cheats::MoveWorkCount(Cheats::Kind::Monster);
+    const float px = F(plw + kPlwPosition), py = F(plw + kPlwPosition + 4), pz = F(plw + kPlwPosition + 8);
+    float nearest = 1.0e30f;
+    int32_t nearestIndex = -1;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if (int32_t(i) == exceptIndex)
+            continue;
+        const uint32_t work = Cheats::MoveWork(Cheats::Kind::Monster, i);
+        if (!IsLargeMonster(work))
+            continue;
+
+        const float dx = F(work + kMonsterPosition) - px;
+        const float dy = F(work + kMonsterPosition + 4) - py;
+        const float dz = F(work + kMonsterPosition + 8) - pz;
+        const float distance = dx * dx + dy * dy + dz * dz;
+        if (distance < nearest) {
+            nearest = distance;
+            nearestIndex = int32_t(i);
+        }
+    }
+    return nearestIndex;
+}
+
+void SetTouchLockTarget(TouchLockState& state, uint32_t index) {
+    state.targetIndex = index;
+    state.targetWork = Cheats::MoveWork(Cheats::Kind::Monster, index);
+    state.targetKind = state.targetWork ? Memory::Read8(state.targetWork + kMonsterKind) : 0;
+    state.focusInitialized = false;
+}
+
+bool TouchLockTargetValid(const TouchLockState& state) {
+    const uint32_t current = Cheats::MoveWork(Cheats::Kind::Monster, state.targetIndex);
+    return current && current == state.targetWork && IsLargeMonster(current) && Memory::Read8(current + kMonsterKind) == state.targetKind;
 }
 
 // `x += (wanted - x) / d` over this step: d becomes MH3_EaseDivisor(d).
@@ -559,6 +631,72 @@ static void FieldCameraUpdatePort(CpuContext* ctx) {
         }
     }
 #endif
+    TouchLockState& lock = TouchLock();
+    if (TakeTouchCameraMoved())
+        lock.manualOverrideTicks = 12.0;
+    else if (lock.manualOverrideTicks > 0.0)
+        lock.manualOverrideTicks = std::max(0.0, lock.manualOverrideTicks - GameStep::Ticks());
+
+    uint32_t taps = TakeTouchTargetTaps();
+    while (taps-- > 0) {
+        if (lock.phase == 0) {
+            const int32_t nearest = NearestLargeMonster(plw, -1);
+            if (nearest >= 0) {
+                SetTouchLockTarget(lock, uint32_t(nearest));
+                lock.phase = 1;
+            }
+        } else if (lock.phase == 1) {
+            const int32_t next = NearestLargeMonster(plw, int32_t(lock.targetIndex));
+            if (next >= 0)
+                SetTouchLockTarget(lock, uint32_t(next));
+            lock.phase = 2;
+        } else {
+            lock = TouchLockState{};
+        }
+    }
+
+    if (lock.phase != 0 && !TouchLockTargetValid(lock))
+        lock = TouchLockState{};
+
+    // While the player is manually swiping the camera, leave the original
+    // camera untouched and keep the blend origin current. Tracking resumes
+    // smoothly once the swipe has ended and the short override window expires.
+    if (lock.phase != 0 && lock.manualOverrideTicks > 0.0) {
+        for (unsigned axis = 0; axis < 3; ++axis)
+            lock.focus[axis] = F(cam + kTarget + 4 * axis);
+        lock.focusInitialized = true;
+    } else if (lock.phase != 0) {
+        const uint32_t monster = lock.targetWork;
+        if (!lock.focusInitialized) {
+            for (unsigned axis = 0; axis < 3; ++axis)
+                lock.focus[axis] = F(cam + kTarget + 4 * axis);
+            lock.focusInitialized = true;
+        }
+
+        float wanted[3] = {
+            F(monster + kMonsterPosition),
+            F(monster + kMonsterPosition + 4),
+            F(monster + kMonsterPosition + 8)
+        };
+        const float height = F(monster + kMonsterHeight);
+        if (std::isfinite(height) && height > 0.0f)
+            wanted[1] += std::clamp(height * 0.45f, 100.0f, 2500.0f);
+
+        // A low-pass blend gives the camera soft tracking rather than hard
+        // centering. All three axes are blended, including underwater depth.
+        const float trackingBlend = float(1.0 - std::pow(1.0 - 0.12, GameStep::Scale()));
+        for (unsigned axis = 0; axis < 3; ++axis)
+            lock.focus[axis] += (wanted[axis] - lock.focus[axis]) * trackingBlend;
+
+        const uint32_t target = frame[8], eye = frame[20];
+        game.Call<VecCopy>({eye, cam + kEye});
+        for (unsigned axis = 0; axis < 3; ++axis)
+            Memory::WriteFloat32(target + 4 * axis, lock.focus[axis]);
+        WF(cam + kTwist, 0.0f);
+        game.Call<CameraSet>({0, eye, target}, {F(cam + kFovA), 0.0f});
+        return;
+    }
+
     WF(cam + kTwist, 0.0f);
     game.Call<CameraSet>({0, cam + kEye, cam + kTarget}, {F(cam + kFovA), 0.0f});
 }
